@@ -1,0 +1,210 @@
+import json
+import logging
+import os
+from typing import List
+from urllib.parse import urlparse
+
+import dotenv
+import openai
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
+from readability import Document
+
+dotenv.load_dotenv()
+OPENAI_KEY = os.getenv("OPENAI_KEY")
+openai.api_key = OPENAI_KEY
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+MODEL = "gpt-3.5-turbo"
+
+app = FastAPI(
+    title="Daigest",
+    version="1.0",
+    summary="HackerNews Daily Digest",
+)
+
+
+@app.get("/")
+def main() -> List[dict]:
+    """
+    Fetch the top 10 stories from Hacker News, summarize the content, and return a JSON object
+    containing the title, URL, and summary for each story.
+
+    Returns:
+        A list of dictionaries, where each dictionary contains the title, URL, summary, and text
+        of a top story.
+    """
+    # Fetch the top 10 stories from Hacker News
+    hn_stories = get_hackernews_top_stories(10)
+    content = []
+
+    # Summarize each story's content and store the results in a list of dictionaries
+    for story in hn_stories:
+        # Extract the text content from the story's URL
+        text = get_url_text(story["url"])
+
+        if text is None:
+            continue
+
+        # Generate a summary of the text content
+        story["text"] = text[:100]
+        story["summary"] = summarize(text)
+
+        content.append(story)
+
+    # Write the content to a JSON file for backup purposes
+    try:
+        with open("stories.json", "a") as f:
+            json.dump(content, f)
+    except Exception as e:
+        logger.warning("Failed to write content to JSON file: %s", str(e))
+
+    return content
+
+
+def get_hackernews_top_stories(n: int) -> List[dict]:
+    """
+    Fetch the top n stories from Hacker News and return a list of dictionaries
+    containing the title, URL, and score for each story.
+
+    Args:
+        n: The number of top stories to fetch.
+
+    Returns:
+        A list of dictionaries, where each dictionary contains the title, URL, and score
+        of a top story.
+    """
+    # Make a GET request to the Hacker News API to fetch the top story IDs
+    response = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json")
+
+    # Check if the request was successful
+    if response.status_code != 200:
+        logger.error("Failed to fetch top stories from Hacker News.")
+        return []
+
+    # Extract the top n story IDs from the API response
+    top_stories = response.json()[:n]
+    stories = []
+
+    # Fetch details for each story
+    for story_id in top_stories:
+        story = requests.get(
+            f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json"
+        ).json()
+
+        # Ignore stories with no URL or that are job postings
+        if "url" not in story or story["type"] == "job":
+            continue
+
+        # Extract the title, URL, and score of the story
+        story_data = {
+            "title": story["title"],
+            "url": story["url"],
+            "score": story["score"],
+        }
+
+        stories.append(story_data)
+
+    return stories
+
+
+def get_url_text(url: str) -> str:
+    """
+    Extract the text content from a given URL and return it as a string.
+
+    Args:
+        url: The URL of the webpage to extract text from.
+
+    Returns:
+        A string containing the text content of the webpage.
+    """
+    # Make a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the response is taking too long
+    if response.elapsed.total_seconds() > 5:
+        logger.warning("Request timed out for URL: %s", url)
+        return None
+
+    # Check if the request was successful
+    if response.status_code != 200:
+        logger.warning("Failed to fetch URL: %s", url)
+        return None
+
+    # Check if the response contains HTML content
+    content_type = response.headers.get("Content-Type")
+    if not content_type or "html" not in content_type:
+        logger.warning("Unsupported content type for URL: %s", url)
+        return None
+
+    # Extract the text content from the HTML
+    doc = Document(response.content)
+    soup = BeautifulSoup(doc.summary(), "html.parser")
+    html_soup = soup.find_all(text=True)
+
+    blacklist = [
+        "[document]",
+        "noscript",
+        "header",
+        "html",
+        "meta",
+        "head",
+        "input",
+        "script",
+        "style",
+    ]
+
+    text = ""
+
+    for page_el in html_soup:
+        if page_el.parent.name not in blacklist:
+            text += "{} ".format(page_el)
+
+    # Check if any text content was extracted
+    if not text:
+        logger.warning("No text content found for URL: %s", url)
+        return None
+
+    return text
+
+
+def summarize(text: str) -> str:
+    """
+    Generate an abstractive summary of a given text using OpenAI's GPT-3.5 model.
+
+    Args:
+        text: The text to be summarized.
+
+    Returns:
+        A string containing the abstractive summary generated by the GPT-3.5 model.
+    """
+    # Call the OpenAI API to generate a summary for the given text
+    try:
+        payload = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Please provide a detailed and truthful abstractive summary of the following content:",
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+        )
+
+        # Extract the summary from the API response
+        summary_text = payload["choices"][0]["message"]["content"]
+
+        return summary_text
+
+    except openai.error.APIError as e:
+        logger.error("Failed to generate summary with OpenAI: %s", str(e))
+        return ""
+
+
+main()

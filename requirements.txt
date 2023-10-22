@@ -1,0 +1,6 @@
+beautifulsoup4==4.9.3
+fastapi==0.68.1
+openai==0.10.5
+python-dotenv==0.19.1
+readability-lxml==0.8.1
+requests==2.26.0
